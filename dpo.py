@@ -1,29 +1,28 @@
-# 0. imports
-import os
-import torch
+"""Direct Preference Optimization on top of an SFT checkpoint, driven by `trl.DPOTrainer`.
 
+Usage:
+    accelerate launch --config_file configs/accelerate_configs/ds_stage2.yaml dpo.py
+"""
+
+import os
+import random
 from dataclasses import dataclass, field
+from glob import glob
 from typing import Dict, Optional
 
-from accelerate import Accelerator
+import torch
 from datasets import Dataset, load_dataset
-from peft import LoraConfig
 from transformers import HfArgumentParser, TrainingArguments, set_seed
-from glob import glob
 from trl import DPOTrainer
-import random
 
+from models.configuration_vocab_32k_gpt2_moe import Vocab32kGPT2MoeConfig
+from models.modeling_vocab_32k_gpt2_moe import Vocab32kGPT2MoeForCausalLM
+from models.tokenization_vocab_32k_gpt2 import Vocab32kGPT2Tokenizer
 
-from models.tokenization_vocab_32k_gpt2 import vocab_32k_gpt2Tokenizer
-from models.configuration_vocab_32k_gpt2_moe import vocab_32k_gpt2moeConfig
-from models.modeling_vocab_32k_gpt2_moe import vocab_32k_GPT2MOELMHeadModel
-# Define and parse arguments.
 
 @dataclass
 class ScriptArguments:
-    """
-    The arguments for the DPO training script.
-    """
+    """Command-line arguments for the DPO training script."""
 
     # data parameters
     beta: Optional[float] = field(default=0.1, metadata={"help": "the beta parameter for DPO loss"})
@@ -76,7 +75,7 @@ class ScriptArguments:
     report_to: Optional[str] = field(
         default="tensorboard",
         metadata={
-            "help": 'The list of integsrations to report the results and logs to. Supported platforms are `"azure_ml"`,'
+            "help": 'The list of integrations to report the results and logs to. Supported platforms are `"azure_ml"`,'
             '`"comet_ml"`, `"mlflow"`, `"neptune"`, `"tensorboard"`,`"clearml"` and `"wandb"`. '
             'Use `"all"` to report to all integrations installed, `"none"` for no integrations.'
         },
@@ -99,26 +98,27 @@ def return_prompt_and_responses(samples) -> Dict[str, str]:
             "### Instruction: " + question + "\n\n### System: \n"
             for question in samples["question"]
         ],
-        "chosen": samples["response_j"], # rated better than k
-        "rejected": samples["response_k"], # rated worse than j
+        "chosen": samples["response_j"],  # rated better than k
+        "rejected": samples["response_k"],  # rated worse than j
     }
+
 
 def get_dataset_paired(
     data_patterns,
     sanity_check: bool = False,
     num_proc=24,
 ) -> Dataset:
-    """Load the stack-exchange-paired dataset from Hugging Face and convert it to the necessary format.
+    """Load paired preference data from local JSONL files and convert it to the format `DPOTrainer` expects.
 
-    The dataset is converted to a dictionary with the following structure:
+    Every input record must contain:
     {
-        'question': List[str],
-        'response_j': List[str], # which is better than response_k
-        'response_k': List[str],
+        'question': str,
+        'response_j': str,  # the preferred response
+        'response_k': str,  # the rejected response
     }
 
-    questions are structured as follows:
-      "### Instruction: \n" + <question> + "\n\n### System: \n"
+    Prompts are rendered with the same instruction template as SFT:
+      "### Instruction: " + <question> + "\n\n### System: \n"
     """
     all_data_files = []
     for name, pattern in data_patterns.items():
@@ -142,27 +142,29 @@ def get_dataset_paired(
 
 
 if __name__ == "__main__":
-
-
     parser = HfArgumentParser(ScriptArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
 
     set_seed(script_args.seed)
 
-    # 1. load a pretrained model
+    # 1. Load the SFT model that DPO starts from
     torch_dtype = torch.float
     if script_args.model_dtype == "float16":
         torch_dtype = torch.float16
     elif script_args.model_dtype == "bfloat16":
         torch_dtype = torch.bfloat16
 
-    tokenizer = vocab_32k_gpt2Tokenizer(vocab_file="configs/tokenizer_models/vocab_32k_gpt2_moe.model", legacy=False)
-    tokenizer.pad_token = tokenizer.eos_token # I don't konw the reason.Huggingface Hub likes to set like this.
-    model_config = vocab_32k_gpt2moeConfig.from_pretrained("configs/model_configs/vocab_32k_gpt2_moe.json")
+    tokenizer = Vocab32kGPT2Tokenizer(vocab_file="configs/tokenizer_models/vocab_32k_gpt2_moe.model", legacy=False)
+    # DPOTrainer pads chosen/rejected pairs with the eos token, matching the convention used by the TRL examples.
+    tokenizer.pad_token = tokenizer.eos_token
+    model_config = Vocab32kGPT2MoeConfig.from_pretrained("configs/model_configs/vocab_32k_gpt2_moe.json")
     model_config.vocab_size = tokenizer.vocab_size
     model_config.pad_token_id = tokenizer.pad_id
-    model = vocab_32k_GPT2MOELMHeadModel.from_pretrained(
-        "ckpt/vocab_32k_gpt2_moe_sft4dpo/checkpoint_epoch6", config=model_config, low_cpu_mem_usage=True, torch_dtype=torch_dtype
+    model = Vocab32kGPT2MoeForCausalLM.from_pretrained(
+        script_args.model_name_or_path,
+        config=model_config,
+        low_cpu_mem_usage=True,
+        torch_dtype=torch_dtype,
     )
     model.config.use_cache = False
 
@@ -172,22 +174,22 @@ if __name__ == "__main__":
             name for name, buffer in model.named_buffers() if buffer.dtype == torch.bool
         ]
 
-    # 2. Load the Stack-exchange paired dataset
+    # 2. Load the paired preference dataset. New sources must first be converted to the
+    #    question / response_j / response_k schema documented on `get_dataset_paired`.
     data_patterns = {
         "mix_dpo_dataset": "data/DPO/mix_dpo_data.jsonl",
     }
 
-    # if add dataset, firstly need to transform to a fixed format and mofify 'get_stack_exchange_paired'
     train_dataset = get_dataset_paired(data_patterns=data_patterns, sanity_check=script_args.sanity_check)
 
-    # 3. Load evaluation dataset 
-    # eval_dataset = get_stack_exchange_paired(data_dir="data/evaluation", sanity_check=True)
+    # 3. Optional held-out split, disabled by default:
+    # eval_dataset = get_dataset_paired({"eval": "data/DPO/eval_dpo_data.jsonl"}, sanity_check=True)
     # eval_dataset = eval_dataset.filter(
     #     lambda x: len(x["prompt"]) + len(x["chosen"]) <= script_args.max_length
     #     and len(x["prompt"]) + len(x["rejected"]) <= script_args.max_length
     # )
 
-    # 4. initialize training arguments:
+    # 4. Initialize the training arguments
     training_args = TrainingArguments(
         per_device_train_batch_size=script_args.per_device_train_batch_size,
         per_device_eval_batch_size=script_args.per_device_eval_batch_size,
@@ -206,12 +208,12 @@ if __name__ == "__main__":
         optim=script_args.optimizer_type,
         bf16=True,
         remove_unused_columns=False,
-        run_name="vocab_32k_gpt2_dpo",
+        run_name="vocab_32k_gpt2_moe_dpo",
         gradient_checkpointing_kwargs=dict(use_reentrant=script_args.gradient_checkpointing_use_reentrant),
         seed=script_args.seed,
     )
 
-    # If use lora
+    # 5. Optional LoRA adapters. Import `LoraConfig` from `peft` and pass `peft_config=peft_config` to `DPOTrainer`.
     # peft_config = LoraConfig(
     #     r=script_args.lora_r,
     #     lora_alpha=script_args.lora_alpha,
@@ -229,7 +231,7 @@ if __name__ == "__main__":
     #     task_type="CAUSAL_LM",
     # )
 
-    # 5. initialize the DPO trainer
+    # 6. Initialize the DPO trainer. `ref_model=None` makes TRL keep a frozen copy of the policy as reference.
     dpo_trainer = DPOTrainer(
         model,
         ref_model=None,
@@ -242,10 +244,10 @@ if __name__ == "__main__":
         dataset_num_proc=8
     )
 
-    # 6. train
+    # 7. Train
     dpo_trainer.train()
     dpo_trainer.save_model(script_args.output_dir)
 
-    # 7. save
+    # 8. Save the aligned policy
     output_dir = os.path.join(script_args.output_dir, "final_checkpoint")
     dpo_trainer.model.save_pretrained(output_dir)

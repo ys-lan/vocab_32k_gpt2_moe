@@ -1,7 +1,8 @@
 {
   "architectures": [
-    "vocab_32k_GPT2_MOELMHeadModel"
+    "Vocab32kGPT2MoeForCausalLM"
   ],
+  "model_type": "vocab_32k_gpt2moe",
   "bos_token_id": 1,
   "eos_token_id": 2,
   "pad_token_id": 3,

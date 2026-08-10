@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" vocab_32k_gpt2 model configuration"""
+"""Vocab32kGPT2Moe model configuration."""
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -21,34 +21,22 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-GUYU_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
-logger = logging.get_logger(__name__)
-
-GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP = {
-    "gpt2": "https://huggingface.co/gpt2/resolve/main/config.json",
-    "gpt2-medium": "https://huggingface.co/gpt2-medium/resolve/main/config.json",
-    "gpt2-large": "https://huggingface.co/gpt2-large/resolve/main/config.json",
-    "gpt2-xl": "https://huggingface.co/gpt2-xl/resolve/main/config.json",
-    "distilgpt2": "https://huggingface.co/distilgpt2/resolve/main/config.json",
-}
-
-
-class vocab_32k_gpt2moeConfig(PretrainedConfig):
+class Vocab32kGPT2MoeConfig(PretrainedConfig):
     """
-    This is the configuration class to store the configuration of a [`GPT2Model`] or a [`TFGPT2Model`]. It is used to
-    instantiate a GPT-2 model according to the specified arguments, defining the model architecture. Instantiating a
-    configuration with the defaults will yield a similar configuration to that of the GPT-2
-    [gpt2](https://huggingface.co/gpt2) architecture.
+    This is the configuration class to store the configuration of a [`Vocab32kGPT2MoeModel`]. It is used to instantiate
+    a GPT-2 style decoder in which part of the feed-forward blocks are replaced by a top-k routed mixture of experts.
+    Instantiating a configuration with the defaults will yield a GPT-2 base backbone (12 layers, 768 hidden, 12 heads)
+    paired with a 32K SentencePiece vocabulary and dense feed-forward blocks.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
 
     Args:
-        vocab_size (`int`, *optional*, defaults to 50257):
-            Vocabulary size of the GPT-2 model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`GPT2Model`] or [`TFGPT2Model`].
+        vocab_size (`int`, *optional*, defaults to 32000):
+            Vocabulary size of the model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`Vocab32kGPT2MoeModel`].
         n_positions (`int`, *optional*, defaults to 1024):
             The maximum sequence length that this model might ever be used with. Typically set this to something large
             just in case (e.g., 512 or 1024 or 2048).
@@ -72,61 +60,65 @@ class vocab_32k_gpt2moeConfig(PretrainedConfig):
             The epsilon to use in the layer normalization layers.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        summary_type (`string`, *optional*, defaults to `"cls_index"`):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
-
-            Has to be one of the following options:
-
-                - `"last"`: Take the last token hidden state (like XLNet).
-                - `"first"`: Take the first token hidden state (like BERT).
-                - `"mean"`: Take the mean of all tokens hidden states.
-                - `"cls_index"`: Supply a Tensor of classification token position (like GPT/GPT-2).
-                - `"attn"`: Not implemented now, use multi-head attention.
+        summary_type (`str`, *optional*, defaults to `"cls_index"`):
+            Sequence-summary strategy inherited from the GPT-2 configuration. Unused by the causal LM heads shipped in
+            this repository, kept so that GPT-2 checkpoints remain loadable. One of `"last"`, `"first"`, `"mean"`,
+            `"cls_index"` or `"attn"`.
         summary_use_proj (`bool`, *optional*, defaults to `True`):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
-
-            Whether or not to add a projection after the vector extraction.
+            Whether or not to add a projection after the sequence-summary vector extraction.
         summary_activation (`str`, *optional*):
-            Argument used when doing sequence summary. Used in for the multiple choice head in
-            [`GPT2DoubleHeadsModel`].
-
-            Pass `"tanh"` for a tanh activation to the output, any other value will result in no activation.
+            Activation applied on top of the sequence-summary projection. Pass `"tanh"` for a tanh activation, any
+            other value results in no activation.
         summary_proj_to_labels (`bool`, *optional*, defaults to `True`):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
-
-            Whether the projection outputs should have `config.num_labels` or `config.hidden_size` classes.
+            Whether the sequence-summary projection outputs should have `config.num_labels` or `config.hidden_size`
+            classes.
         summary_first_dropout (`float`, *optional*, defaults to 0.1):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
-
-            The dropout ratio to be used after the projection and activation.
+            The dropout ratio applied after the sequence-summary projection and activation.
         scale_attn_weights (`bool`, *optional*, defaults to `True`):
-            Scale attention weights by dividing by sqrt(hidden_size)..
+            Scale attention weights by dividing by `sqrt(head_dim)`.
         use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models).
-        bos_token_id (`int`, *optional*, defaults to 50256):
+            Whether or not the model should return the last key/values attentions.
+        bos_token_id (`int`, *optional*, defaults to 1):
             Id of the beginning of sentence token in the vocabulary.
-        eos_token_id (`int`, *optional*, defaults to 50256):
+        eos_token_id (`int`, *optional*, defaults to 2):
             Id of the end of sentence token in the vocabulary.
         scale_attn_by_inverse_layer_idx (`bool`, *optional*, defaults to `False`):
             Whether to additionally scale attention weights by `1 / layer_idx + 1`.
         reorder_and_upcast_attn (`bool`, *optional*, defaults to `False`):
             Whether to scale keys (K) prior to computing attention (dot-product) and upcast attention
             dot-product/softmax to float() when training with mixed precision.
+        n_shared_experts (`int`, *optional*):
+            Number of always-active shared experts evaluated in parallel with the routed experts and added to their
+            output. `None` disables shared experts. Requires `moe_intermediate_size` to be set, because the shared
+            expert width is `moe_intermediate_size * n_shared_experts`.
+        n_routed_experts (`int`, *optional*):
+            Number of routed experts per MoE block. `None` keeps every feed-forward block dense, which reduces the
+            model to plain GPT-2.
+        num_experts_per_tok (`int`, *optional*):
+            Number of experts each token is dispatched to (the `k` of top-k routing).
+        moe_layer_freq (`int`, *optional*, defaults to 1):
+            Convert every `moe_layer_freq`-th decoder layer into an MoE layer. `1` means every layer.
+        first_k_dense_replace (`int`, *optional*, defaults to 0):
+            Keep the first `first_k_dense_replace` decoder layers dense before starting to insert MoE blocks.
+        norm_topk_prob (`bool`, *optional*, defaults to `True`):
+            Whether to renormalize the top-k routing weights so that they sum to one.
+        scoring_func (`str`, *optional*, defaults to `"softmax"`):
+            Function used to turn router logits into expert affinities. Only `"softmax"` is implemented.
+        aux_loss_alpha (`float`, *optional*, defaults to 0.001):
+            Weight of the load-balancing auxiliary loss. `0.0` disables it.
+        seq_aux (`bool`, *optional*, defaults to `True`):
+            Whether to compute the auxiliary load-balancing loss per sequence instead of over the whole batch.
 
     Example:
 
     ```python
-    >>> from transformers import GPT2Config, GPT2Model
+    >>> from models import Vocab32kGPT2MoeConfig, Vocab32kGPT2MoeForCausalLM
 
-    >>> # Initializing a GPT2 configuration
-    >>> configuration = GPT2Config()
+    >>> # A 12-layer GPT-2 backbone with 8 experts per layer and top-2 routing
+    >>> configuration = Vocab32kGPT2MoeConfig(n_routed_experts=8, num_experts_per_tok=2)
 
     >>> # Initializing a model (with random weights) from the configuration
-    >>> model = GPT2Model(configuration)
+    >>> model = Vocab32kGPT2MoeForCausalLM(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -166,15 +158,15 @@ class vocab_32k_gpt2moeConfig(PretrainedConfig):
         eos_token_id=2,
         scale_attn_by_inverse_layer_idx=False,
         reorder_and_upcast_attn=False,
-        n_shared_experts = None,
-        n_routed_experts = None,
-        num_experts_per_tok = None,
-        moe_layer_freq = 1,
-        first_k_dense_replace = 0,
-        norm_topk_prob = True,
-        scoring_func = 'softmax',
-        aux_loss_alpha = 0.001,
-        seq_aux = True,
+        n_shared_experts=None,
+        n_routed_experts=None,
+        num_experts_per_tok=None,
+        moe_layer_freq=1,
+        first_k_dense_replace=0,
+        norm_topk_prob=True,
+        scoring_func="softmax",
+        aux_loss_alpha=0.001,
+        seq_aux=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -202,7 +194,6 @@ class vocab_32k_gpt2moeConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-        self.num_experts_per_tok=num_experts_per_tok
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -214,3 +205,7 @@ class vocab_32k_gpt2moeConfig(PretrainedConfig):
         self.seq_aux = seq_aux
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+
+
+# Deprecated alias kept for configs and scripts written against the original class name.
+vocab_32k_gpt2moeConfig = Vocab32kGPT2MoeConfig

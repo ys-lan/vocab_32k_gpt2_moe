@@ -18,7 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tokenization classes for vocab_32k_gpt2."""
+"""Tokenization classes for Vocab32kGPT2Moe."""
 import os
 from shutil import copyfile
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import sentencepiece as spm
 
 from transformers.convert_slow_tokenizer import import_protobuf
-from transformers.tokenization_utils import AddedToken, PreTrainedTokenizer
+from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.utils import logging
 
 
@@ -63,11 +63,12 @@ correct. If you don't know the answer to a question, please don't share false in
 # fmt: on
 
 
-# copy from llama with llama->vocab_32k_gpt2
-class vocab_32k_gpt2Tokenizer(PreTrainedTokenizer):
+# Adapted from transformers.models.llama.tokenization_llama with llama -> vocab_32k_gpt2
+class Vocab32kGPT2Tokenizer(PreTrainedTokenizer):
     """
-    Construct a Gyu tokenizer. Based on byte-level Byte-Pair-Encoding. The default padding token is unset as there is
-    no padding token in the original model.
+    Construct a Vocab32kGPT2Moe tokenizer, backed by a 32K SentencePiece unigram model. Unlike the original GPT-2
+    tokenizer, `<unk>`, `<s>`, `</s>` and `<pad>` ids are read straight from the SentencePiece model so that the model
+    configuration and the tokenizer can never drift apart.
 
     Args:
         vocab_file (`str`):
@@ -473,5 +474,10 @@ class vocab_32k_gpt2Tokenizer(PreTrainedTokenizer):
 
         return template
 
-class GuxuTokenizer(vocab_32k_gpt2Tokenizer):
-    pass
+
+# Deprecated aliases kept for scripts written against the original class names.
+vocab_32k_gpt2Tokenizer = Vocab32kGPT2Tokenizer
+
+
+class GuxuTokenizer(Vocab32kGPT2Tokenizer):
+    """Deprecated alias of [`Vocab32kGPT2Tokenizer`]."""

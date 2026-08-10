@@ -1,30 +1,32 @@
+# Stage 1 - Pretraining the MoE base model from scratch.
+# Launch: bash scripts/launch/pre_train_moe.sh
 data:
-  mode: "pretrain"
-  data: 
+  mode: "pretrain"                 # pretrain | instruct
+  data:                            # name -> glob pattern of JSONL shards
     sky-pile150B: "data/skypile/2020-40_*.jsonl"
     openwebtext: "data/openwebtext/openwebtext.jsonl"
-  pad_to_max: False
-  sequence_sample_mode: "none"
-  concat_multiple_sequence: True
-  num_sequences: 10
+  pad_to_max: False                # pad every document to seq_length
+  sequence_sample_mode: "none"     # truncation | none | sample | split
+  concat_multiple_sequence: True   # pack documents together to avoid padding waste
+  num_sequences: 10                # documents packed per concatenation window
   seq_length: 600
   tokenizer_model_path: "configs/tokenizer_models/vocab_32k_gpt2_moe.model"
-  split_by_shard: False
+  split_by_shard: False            # shard files across ranks instead of skipping records
 train:
-  train_batch_size: 16
-  num_training_steps: 1000000
+  train_batch_size: 16             # per-process batch size
+  num_training_steps: 1000000      # counted in data steps, i.e. before gradient accumulation
   num_warmup_steps: 2000
   initializer_range: 1.0e-2
   lr: 2.0e-4
-  ckpt:
+  ckpt:                            # weights to initialize from; empty means random init
   weight_decay: 1.0e-1
   train_num_workers_4_dataloader: 16
   gradient_accumulation_steps: 2
   prefetch_factor: 100
-  train_and_eval: False
+  train_and_eval: False            # sample from val_set_pretrain every eval_interval
   gradient_checkpointing_enable: False
   use_lora: False
-# global step
+# Intervals below are expressed in global steps.
 log_interval: 10
 eval_interval: 100
 save_interval: 1000

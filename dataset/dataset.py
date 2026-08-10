@@ -1,71 +1,30 @@
+"""Streaming dataset construction for pretraining and supervised fine-tuning.
+
+Adapted from Open-Llama/dataset/dataset.py.
 """
-FilePath: /Open-Llama/dataset/dataset.py
-"""
+import copy
 import math
-import torch
 import random
 from glob import glob
+
+import torch
 from datasets import load_dataset
-from models.tokenization_vocab_32k_gpt2 import vocab_32k_gpt2Tokenizer
-import copy
+
+from models.tokenization_vocab_32k_gpt2 import Vocab32kGPT2Tokenizer
 
 random.seed(42)
 
 
 def pretrain_transform(batch):
-    #SkyPile-150B and OpenWebtext
+    """Normalize a raw pretraining record into a single `text` field.
 
-    if("text") in batch:
+    SkyPile-150B and OpenWebText already ship a `text` field, so this is a no-op. Corpora with a different schema
+    should be folded into `text` here before tokenization.
+    """
+    if ("text") in batch:
         pass
     return batch
-    # wudao preprocess
-    # if "uniqueKey" in batch:
-    #     assert len(batch["title"]) == 1
-    #     batch["text"] = [batch["title"][0] + "\n" + batch["content"][0]]    
-    # #pajama preprocess a
-    # elif "text" in batch and "meta" in batch:
-    #     pass
-    # #baike preprocess
-    # elif "basic_info" in batch and "main_content" in batch:
-    #     title = ""
-    #     main_content = ""
-    #     if "title" in  batch and batch["title"] and batch["title"][0]:
-    #         title = batch["title"][0]
-    #     if "main_content" in batch and batch["main_content"] and batch["main_content"][0]:
-    #         main_content = batch["main_content"][0]
-    #     if title or main_content:
-    #         batch["text"] = [title + "\n" + main_content]
-    #     else:
-    #         batch["text"] =["百度百科"]
-    # #pnews preprocess
-    # elif "channel" in batch and "type" in batch:
-    #         title = ""
-    #         text = ""
-    #         if "title" in  batch and batch["title"] and batch["title"][0]:
-    #             title = batch["title"][0]
-    #         if "text" in batch and batch["text"] and batch["text"][0]:
-    #             text = batch["text"][0]
-    #         if title or text:
-    #             del batch["text"]
-    #             batch["text"] =[title + "\n" + text]
-    #         else:
-    #             batch["text"] =["新闻"]
-    # #plyrics preprocess
-    # elif "singer" in batch:
-    #     text = batch["text"][0]
-    #     del batch["text"]
-    #     batch["text"] = [batch["title"][0] + "\n" + text]
-    # #pshici preprocess
-    # elif "author" in batch:
-    #     text = batch["text"][0]
-    #     del batch["text"]
-    #     batch["text"] = [batch["title"][0] + "\n" + text]
-    # #pcouplets preprocess
-    # elif "text" in batch and "type" in batch:
-    #     pass
-    # else:
-    #     raise Exception("Unrecognized pretrain dataset format.")
-    # return batch
+
 
 def _prompt_no_input(row):
     return ("Below is an instruction that describes a task. "
@@ -213,7 +172,8 @@ def construct_dataset(
         assert len(data_files) > 0
         all_data_files.extend(data_files)
     random.shuffle(all_data_files)
-    # 当shard可以被world_size整除时 split_dataset_by_node 会直接按shard进行划分，否则会读所有数据然后跳过一部分，可能会慢一点
+    # When the shard count is divisible by world_size, split_dataset_by_node shards the files directly. Otherwise it
+    # reads every record and skips part of them on each rank, which is noticeably slower.
     # https://huggingface.co/docs/datasets/package_reference/main_classes#datasets.distributed.split_dataset_by_node
     if world_size is not None:
         num_shards = len(all_data_files)
@@ -223,7 +183,7 @@ def construct_dataset(
     )
     # shuffle
     dataset = dataset.shuffle(seed=42)
-    # 文本预处理转换为统一格式
+    # Normalize the raw records into a common text schema
     if dataset_config["mode"] == "pretrain":
         dataset = dataset.map(pretrain_transform, batched=True, batch_size=1)
     elif dataset_config["mode"] == "instruct":
@@ -307,10 +267,10 @@ def construct_dataset(
             drop_last_batch=True,
         )
 
+    # labels: SFT masks the prompt, pretraining trains on every non-padding token
     if(dataset_config["mode"] == "instruct"):
-        # full_dataset.set_format(type="torch")
         full_dataset = full_dataset.map(lambda example: get_sft_labels_gen(example, tokenizer.pad_id))
-    else:# add label
+    else:
         full_dataset = full_dataset.map(get_labels_gen(tokenizer.pad_id))
     # shuffle
     full_dataset = full_dataset.shuffle(seed=42)
@@ -318,8 +278,8 @@ def construct_dataset(
 
 
 if __name__ == "__main__":
+    # Smoke test: check that tokenize -> decode round-trips, then dump one collated batch.
     import time
-    from unicodedata import normalize
     from torch.utils.data import DataLoader
 
     data_config = {
@@ -330,14 +290,13 @@ if __name__ == "__main__":
         "concat_multiple_sequence": False,
         "num_sequences": 10,
         "seq_length": 1000,
-        "tokenizer_model_path": "configs/tokenizer_models/vocab_32k_gpt2.model"
+        "tokenizer_model_path": "configs/tokenizer_models/vocab_32k_gpt2_moe.model"
     }
-    tokenizer = vocab_32k_gpt2Tokenizer(vocab_file=data_config["tokenizer_model_path"], legacy=False)
+    tokenizer = Vocab32kGPT2Tokenizer(vocab_file=data_config["tokenizer_model_path"], legacy=False)
     pretrain_dataset = construct_dataset(data_config, tokenizer, True)
     start = time.time()
     for i, line in enumerate(pretrain_dataset):
         raw_text = line["text"]
-        # raw_text = normalize("NFKC", raw_text)
         input_ids = tokenizer(
             line["text"], return_tensors="pt", return_attention_mask=False
         )["input_ids"][0]

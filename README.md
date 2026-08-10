@@ -1,164 +1,190 @@
-# 🤖 vocab_32k_gpt2_moe
+# vocab_32k_gpt2_moe
 
-一个从零开始训练的 32K 词表 GPT2-MoE 项目，包含完整三阶段流程：
+A from-scratch training stack for a **GPT-2 style Mixture-of-Experts language model** with a 32K SentencePiece
+vocabulary, covering the full alignment pipeline: pretraining, supervised fine-tuning, and Direct Preference
+Optimization.
 
-1. 预训练（Pretrain）
-2. 指令微调（SFT）
-3. 偏好优化（DPO）
+<p>
+  <img alt="Python" src="https://img.shields.io/badge/python-3.10%2B-blue">
+  <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.x-ee4c2c">
+  <img alt="DeepSpeed" src="https://img.shields.io/badge/DeepSpeed-ZeRO%201%2F2%2F3-0b5394">
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-green">
+</p>
 
-本仓库基于 PyTorch + Hugging Face Transformers + Accelerate + DeepSpeed + TRL 实现，支持多卡训练和断点续训。
+The model is a plain GPT-2 decoder in which the feed-forward block of each layer is replaced by a top-k routed
+mixture of experts, so a large parameter budget is trained while only a fraction of it is activated per token.
+Everything runs on `accelerate` + DeepSpeed with bf16 mixed precision, streaming datasets, and step-level
+checkpoint resumption.
 
-## ✨ 1. 项目特点
+---
 
-- 自定义 `vocab_32k_gpt2_moe` 模型与 SentencePiece 32K tokenizer
-- 统一训练入口：`train.py` + `trainer.py`
-- 两类训练模式：`pretrain`、`instruct`
-- DPO 对齐训练脚本：`dpo.py`（`trl.DPOTrainer`）
-- 使用 `accelerate + deepspeed` 进行分布式训练
-- 支持通过 `accelerator.load_state(work_dir)` 自动恢复训练状态
+## Contents
 
-## 🗂️ 2. 仓库结构
+- [Pipeline](#pipeline)
+- [Highlights](#highlights)
+- [Model architecture](#model-architecture)
+- [Installation](#installation)
+- [Repository layout](#repository-layout)
+- [Quickstart](#quickstart)
+- [Data formats](#data-formats)
+- [Configuration reference](#configuration-reference)
+- [Distributed training](#distributed-training)
+- [Checkpointing and resumption](#checkpointing-and-resumption)
+- [Logging](#logging)
+- [Evaluation](#evaluation)
+- [Reproducibility](#reproducibility)
+- [Notes and rough edges](#notes-and-rough-edges)
+- [Acknowledgements](#acknowledgements)
+
+---
+
+## Pipeline
+
+```mermaid
+flowchart LR
+    A["Stage 1<br/>Pretrain"] --> B["Stage 2<br/>SFT"]
+    B --> C["Stage 3<br/>SFT for DPO"]
+    C --> D["Stage 4<br/>DPO"]
+```
+
+| Stage | Script | Config | Entry point | Output |
+| --- | --- | --- | --- | --- |
+| 1. Pretrain | `scripts/launch/pre_train_moe.sh` | `configs/pretrain_config.yaml` | `train.py` | `ckpt/vocab_32k_gpt2_moe` |
+| 2. SFT | `scripts/launch/sft.sh` | `configs/instruct_config.yaml` | `train.py` | `ckpt/vocab_32k_gpt2_moe_instruction` |
+| 3. SFT for DPO | `scripts/launch/sft4dpo.sh` | `configs/dpo_instruct_config.yaml` | `train.py` | `ckpt/vocab_32k_gpt2_moe_sft4dpo` |
+| 4. DPO | `scripts/launch/dpo.sh` | CLI flags on `dpo.py` | `dpo.py` | `ckpt/vocab_32k_gpt2_moe_dpo` |
+
+Stage 3 is a short supervised pass over the *prompt distribution used by the preference data*. It keeps the policy
+and the preference pairs in the same domain, which makes DPO markedly more stable.
+
+## Highlights
+
+- **Sparse MoE feed-forward blocks** with top-k routing, optional always-active shared experts, and a
+  load-balancing auxiliary loss that can be computed per sequence or per batch.
+- **One training entry point** (`train.py` + `trainer.py`) shared by pretraining and SFT; the stage is selected
+  purely by config (`data.mode`).
+- **Custom tokenizer contract**: `Vocab32kGPT2Tokenizer` reads `bos`/`eos`/`unk`/`pad` ids straight out of the
+  SentencePiece model, so the tokenizer and the model config can never drift apart.
+- **Streaming data pipeline** with document packing, prompt masking for SFT, and per-rank sharding, so corpora
+  larger than local disk never need to be materialized.
+- **Exact resumption**: optimizer, scheduler and RNG state are restored via `accelerator.load_state`, and the
+  dataloader fast-forwards past batches that were already consumed.
+- **Flash-Attention 2** support, selected through the standard `_attn_implementation` config switch.
+- **LoRA** and gradient checkpointing available as one-line config flags.
+
+## Model architecture
+
+Defaults from `configs/model_configs/vocab_32k_gpt2_moe.json`:
+
+| Component | Value |
+| --- | --- |
+| Layers (`n_layer`) | 12 |
+| Hidden size (`n_embd`) | 768 |
+| Attention heads (`n_head`) | 12 |
+| Context length (`n_positions`) | 1024 |
+| FFN inner size (`n_inner`) | 3072 (`4 x n_embd`) |
+| Vocabulary | 32,000 (SentencePiece unigram) |
+| Routed experts (`n_routed_experts`) | 8 |
+| Experts per token (`num_experts_per_tok`) | 2 |
+| Shared experts (`n_shared_experts`) | disabled |
+| MoE layer frequency (`moe_layer_freq`) | 1 (every layer) |
+| Dense layers before MoE (`first_k_dense_replace`) | 0 |
+| Total parameters | ~507M |
+| Activated parameters per token | ~167M |
+| Token ids | `bos=1`, `eos=2`, `pad=3` |
+
+Input embeddings and the LM head are tied, and `c_proj` weights use the GPT-2 residual-scaled initialization
+(`std = initializer_range / sqrt(2 * n_layer)`).
+
+Public classes, exported from `models/`:
+
+| Class | Role |
+| --- | --- |
+| `Vocab32kGPT2MoeConfig` | Configuration, including all MoE options |
+| `Vocab32kGPT2MoeModel` | Bare decoder stack |
+| `Vocab32kGPT2MoeForCausalLM` | Decoder plus tied LM head |
+| `Vocab32kGPT2MoeDecoderLayer` | One decoder layer (attention + dense or MoE FFN) |
+| `Vocab32kGPT2SparseMoeBlock` | Routed MoE feed-forward block |
+| `MoEGate` | Top-k router and auxiliary load-balancing loss |
+| `Vocab32kGPT2Tokenizer` | SentencePiece tokenizer |
+
+The previous snake_case names (`vocab_32k_GPT2MOELMHeadModel`, `vocab_32k_gpt2moeConfig`,
+`vocab_32k_gpt2Tokenizer`, ...) remain available as deprecated aliases, so existing scripts and checkpoints keep
+working.
+
+### Routing
+
+`MoEGate` scores tokens against an `n_routed_experts x hidden_size` weight matrix, softmaxes the logits, and keeps
+the top `num_experts_per_tok` experts. With `norm_topk_prob=True` the surviving weights are renormalized to sum to
+one. During training, an auxiliary loss pushes the router towards a uniform expert load and is attached to the
+graph through `AddAuxiliaryLoss`, so it contributes gradients without polluting the reported loss value.
+Inference takes a separate path (`Vocab32kGPT2SparseMoeBlock.moe_infer`) that sorts tokens by expert and runs each
+expert exactly once over its slice.
+
+## Installation
+
+Recommended environment:
+
+- Python 3.10+
+- CUDA 11.8+ matching your PyTorch build
+- Linux or WSL2 (the launch scripts are bash)
+
+```bash
+git clone <this-repo> && cd vocab_32k_gpt2_moe
+pip install -r requirements.txt
+```
+
+Flash-Attention 2 is optional and installed separately; the model falls back to the eager attention path when it
+is missing:
+
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+## Repository layout
 
 ```text
 .
-├── train.py
-├── trainer.py
-├── dpo.py
+├── train.py                              # Pretrain / SFT entry point (absl flags)
+├── trainer.py                            # Training loop, logging, checkpointing
+├── dpo.py                                # DPO training via trl.DPOTrainer
 ├── requirements.txt
-├── README.md
 ├── configs/
-│   ├── pretrain_config.yaml
-│   ├── instruct_config.yaml
-│   ├── dpo_instruct_config.yaml
-│   ├── accelerate_configs/
-│   │   ├── ds_stage1.yaml
-│   │   ├── ds_stage2.yaml
-│   │   ├── ds_stage3.yaml
-│   │   └── ds_stage3_offload.yaml
+│   ├── pretrain_config.yaml               # Stage 1
+│   ├── instruct_config.yaml               # Stage 2
+│   ├── dpo_instruct_config.yaml           # Stage 3
+│   ├── default_config.yaml                # Fallback accelerate config
+│   ├── accelerate_configs/                # DeepSpeed ZeRO 1 / 2 / 3 / 3+offload
 │   ├── model_configs/
-│   │   └── vocab_32k_gpt2_moe.json
+│   │   └── vocab_32k_gpt2_moe.json         # Architecture definition
 │   └── tokenizer_models/
-│       ├── vocab_32k_gpt2_moe.model
+│       ├── vocab_32k_gpt2_moe.model        # SentencePiece model
 │       └── vocab_32k_gpt2_moe.vocab
 ├── dataset/
-│   ├── dataset.py
-│   ├── data_iter.py
-│   └── validation.py
+│   ├── dataset.py                          # Streaming pipeline for both modes
+│   ├── data_iter.py                        # Standalone shard-aware JSONL iterator
+│   └── validation.py                       # Fixed qualitative prompt suites
 ├── models/
 │   ├── configuration_vocab_32k_gpt2_moe.py
 │   ├── modeling_vocab_32k_gpt2_moe.py
 │   └── tokenization_vocab_32k_gpt2.py
-└── scripts/
-    ├── launch/
-    │   ├── pre_train_moe.sh
-    │   ├── sft.sh
-    │   ├── sft4dpo.sh
-    │   └── dpo.sh
-    └── eval/
-        ├── test_base_ckpt.py
-        └── test_sft_ckpt.py
+├── scripts/
+│   ├── launch/                             # One script per pipeline stage
+│   └── eval/                               # Generation smoke tests
+└── logs/                                   # Archived training logs
 ```
 
-## ⚙️ 3. 环境准备
+## Quickstart
 
-### 🐍 3.1 Python 与 CUDA
+All commands are run from the repository root, since every config path is relative to it.
 
-建议环境：
-
-- Python 3.10+
-- CUDA 11.8+（按 PyTorch 版本匹配）
-- Linux 或 WSL2（`scripts/launch/*.sh` 为 Linux shell 风格）
-
-### 📦 3.2 安装依赖
-
-```bash
-pip install -r requirements.txt
-pip install trl
-```
-
-说明：`dpo.py` 依赖 `trl.DPOTrainer`，请确保已安装 `trl`。
-
-## 🧠 4. 模型与分词器说明
-
-- 词表模型：`configs/tokenizer_models/vocab_32k_gpt2_moe.model`
-- 模型配置：`configs/model_configs/vocab_32k_gpt2_moe.json`
-- Token ID：
-  - `bos_token_id = 1`
-  - `eos_token_id = 2`
-  - `pad_token_id = 3`
-  - `vocab_size = 32000`
-
-MoE 相关默认参数（见 `configs/model_configs/vocab_32k_gpt2_moe.json`）：
-
-- `n_layer = 12`
-- `moe_layer_freq = 1`
-- `n_routed_experts = 8`
-- `num_experts_per_tok = 2`
-
-## 🧾 5. 数据格式
-
-数据处理入口在 `dataset/dataset.py`，由 `config.data.mode` 控制。
-
-### 📚 5.1 预训练数据（`mode: pretrain`）
-
-默认配置见 `configs/pretrain_config.yaml`：
-
-- `data/skypile/2020-40_*.jsonl`
-- `data/openwebtext/openwebtext.jsonl`
-
-`pretrain_transform` 当前默认读取 `text` 字段，因此样本至少应包含：
-
-```json
-{"text": "你的预训练文本"}
-```
-
-### 🧑‍🏫 5.2 指令数据（`mode: instruct`）
-
-默认配置见：
-
-- `configs/instruct_config.yaml`（`data/sft_merge.jsonl`）
-- `configs/dpo_instruct_config.yaml`（`data/DPO/mix_dpo_data4sft.jsonl`）
-
-`instruct_transform` 依赖字段：
-
-- `instruction`（必需）
-- `output`（必需）
-- `input`（可为空字符串）
-- `history`（可为空列表）
-
-示例：
-
-```json
-{"instruction": "介绍一下你自己", "input": "", "output": "我是一个语言模型...", "history": []}
-```
-
-### ⚖️ 5.3 DPO 数据
-
-`dpo.py` 默认读取：`data/DPO/mix_dpo_data.jsonl`
-
-每条样本需包含：
-
-- `question`
-- `response_j`（偏好更优）
-- `response_k`（偏好较差）
-
-示例：
-
-```json
-{"question": "如何学习深度学习？", "response_j": "建议先学线代和Python...", "response_k": "不知道"}
-```
-
-## 🚀 6. 训练流程（推荐）
-
-推荐顺序：Pretrain -> SFT -> SFT-for-DPO -> DPO
-
-### 🔥 6.1 预训练
+### Stage 1 - Pretrain
 
 ```bash
 bash scripts/launch/pre_train_moe.sh
 ```
 
-等价核心命令：
+Equivalent to:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,4,5,6,7 \
@@ -169,37 +195,33 @@ accelerate launch \
   --model_config configs/model_configs/vocab_32k_gpt2_moe.json
 ```
 
-默认输出目录：`ckpt/vocab_32k_gpt2_moe`
+Leaving `train.ckpt` empty in the config starts from random weights; setting it resumes from existing weights.
 
-### 🛠️ 6.2 指令微调（SFT）
+### Stage 2 - Supervised fine-tuning
 
 ```bash
 bash scripts/launch/sft.sh
 ```
 
-对应配置：`configs/instruct_config.yaml`
+Loads `ckpt/vocab_32k_gpt2_moe/` and writes to `ckpt/vocab_32k_gpt2_moe_instruction`. In `instruct` mode the
+prompt tokens are masked out of the labels, so the loss is computed on responses only.
 
-- 默认从 `ckpt/vocab_32k_gpt2_moe/` 继续训练
-- 输出到 `ckpt/vocab_32k_gpt2_moe_instruction`
-
-### 🧩 6.3 DPO 前的 SFT
+### Stage 3 - SFT on the DPO prompt distribution
 
 ```bash
 bash scripts/launch/sft4dpo.sh
 ```
 
-对应配置：`configs/dpo_instruct_config.yaml`
+Continues from `ckpt/vocab_32k_gpt2_moe_instruction/checkpoint_epoch4` and writes to
+`ckpt/vocab_32k_gpt2_moe_sft4dpo`.
 
-- 默认从 `ckpt/vocab_32k_gpt2_moe_instruction/checkpoint_epoch4` 继续训练
-- 输出到 `ckpt/vocab_32k_gpt2_moe_sft4dpo`
-
-### 🎯 6.4 DPO 训练
+### Stage 4 - Direct Preference Optimization
 
 ```bash
 bash scripts/launch/dpo.sh
 ```
 
-等价命令：
+Equivalent to:
 
 ```bash
 CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 \
@@ -208,67 +230,214 @@ accelerate launch \
   dpo.py
 ```
 
-默认输出目录：`ckpt/vocab_32k_gpt2_moe_dpo/`
+`dpo.py` is configured with command-line flags rather than YAML. Frequently used ones:
 
-## 🧷 7. 关键配置说明
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--model_name_or_path` | `ckpt/vocab_32k_gpt2_moe_sft4dpo/checkpoint_epoch6` | Stage-3 checkpoint DPO starts from |
+| `--beta` | `0.1` | Strength of the KL constraint in the DPO loss |
+| `--learning_rate` | `5e-4` | Peak learning rate |
+| `--max_steps` | `50000` | Total optimizer steps |
+| `--max_length` / `--max_prompt_length` | `1024` / `512` | Truncation budgets |
+| `--per_device_train_batch_size` | `4` | Batch size per GPU |
+| `--gradient_accumulation_steps` | `5` | Accumulation steps |
+| `--output_dir` | `./ckpt/vocab_32k_gpt2_moe_dpo/` | Where checkpoints land |
+| `--sanity_check` | `False` | Train on 1000 samples for a quick end-to-end run |
 
-### 📘 7.1 训练配置（`configs/*.yaml`）
+## Data formats
 
-常用字段：
+Every stage reads newline-delimited JSON. Paths are glob patterns, so sharded corpora work as-is.
 
-- `data.mode`: `pretrain` 或 `instruct`
-- `data.seq_length`: 序列长度
-- `train.train_batch_size`: 每进程 batch size
-- `train.gradient_accumulation_steps`: 梯度累积步数
-- `train.num_training_steps`: 总训练步数
-- `train.num_warmup_steps`: warmup 步数
-- `train.lr`: 学习率
-- `train.ckpt`: 初始化模型路径（可为空）
-- `work_dir`: checkpoint 存储路径
+### Pretraining (`data.mode: pretrain`)
 
-### 🖥️ 7.2 分布式配置（`configs/accelerate_configs/*.yaml`）
+One field is required:
 
-可选：
-
-- `ds_stage1.yaml`
-- `ds_stage2.yaml`（脚本默认）
-- `ds_stage3.yaml`
-- `ds_stage3_offload.yaml`
-
-显存不足时可尝试 `stage3` 或 `stage3_offload`。
-
-## 💾 8. 日志、保存与断点续训
-
-`trainer.py` 中：
-
-- 每隔 `save_interval` 保存状态到 `work_dir/checkpoint_epochX`
-- 启动时尝试 `accelerator.load_state(work_dir)` 自动恢复
-- 默认使用 Weights & Biases，并设置了 `WANDB_MODE=offline`
-
-注意：`trainer.py` 当前写死了 `WANDB_API_KEY` 和 `WANDB_MODE=offline`，如需线上同步建议改为环境变量注入。
-
-## 🧪 9. 推理与快速测试
-
-### 🧱 9.1 基座模型测试
-
-```bash
-python scripts/eval/test_base_ckpt.py
+```json
+{"text": "Raw document text used for next-token prediction."}
 ```
 
-### 🗣️ 9.2 SFT 模型测试
+With `concat_multiple_sequence: true`, `num_sequences` documents are tokenized, concatenated and re-chunked into
+`seq_length` blocks, which removes almost all padding waste. `sequence_sample_mode` controls how oversized
+documents are handled:
 
-```bash
-python scripts/eval/test_sft_ckpt.py
+| Mode | Behaviour |
+| --- | --- |
+| `truncation` | Truncate to `seq_length` at tokenization time |
+| `none` | Keep the full token stream (use together with packing) |
+| `sample` | Sample a random `seq_length` window, biased towards the document start |
+| `split` | Emit every non-overlapping `seq_length` window as a separate example |
+
+### Instruction tuning (`data.mode: instruct`)
+
+```json
+{"instruction": "Introduce yourself.", "input": "", "output": "I am a language model...", "history": []}
 ```
 
-以上脚本会读取 `dataset/validation.py` 中的提示词并打印生成结果。
+- `instruction` and `output` are required; `input` may be an empty string and `history` an empty list.
+- `history` holds `[user, assistant]` turn pairs. Multi-turn records are expanded into one training example per
+  turn, each masked so that only the assistant response contributes to the loss.
 
-## ✅ 10. 可复现建议
+Rendered templates:
 
-- 固定随机种子（项目已在部分流程中设置 `seed`）
-- 记录实验配置副本（建议保存对应的 `configs/*.yaml`）
-- 记录 GPU 数量、显存、CUDA 与依赖版本
+```text
+### Instruction:
+{instruction}
 
-## 📝 11. 补充说明
+### System:
+{output}</s>
+```
 
-`dpo.py` 中 `ScriptArguments.model_name_or_path` 默认值为 `ckpt/vocab_32k_gpt2_moe_sft4dpo/checkpoint_epoch6`，但当前代码实际加载路径写死为同一路径。请根据你真实的 SFT-for-DPO 输出 checkpoint 调整该路径，避免找不到模型。
+```text
+### Instruction:
+{instruction}
+
+### Input:
+{input}
+
+### System:
+{output}</s>
+```
+
+### Preference data (DPO)
+
+`dpo.py` reads `data/DPO/mix_dpo_data.jsonl`:
+
+```json
+{"question": "How should I start learning deep learning?", "response_j": "Start with linear algebra and Python...", "response_k": "No idea."}
+```
+
+`response_j` is the preferred continuation, `response_k` the rejected one. Prompts are rendered with the same
+instruction template as SFT before being handed to `DPOTrainer`.
+
+## Configuration reference
+
+### Training config (`configs/*.yaml`)
+
+**`data` section**
+
+| Key | Meaning |
+| --- | --- |
+| `mode` | `pretrain` or `instruct` |
+| `data` | Mapping of dataset name to JSONL glob pattern |
+| `seq_length` | Tokens per training example |
+| `pad_to_max` | Pad every example to `seq_length` (required for SFT masking) |
+| `sequence_sample_mode` | `truncation`, `none`, `sample` or `split` |
+| `concat_multiple_sequence` | Pack several documents into one example |
+| `num_sequences` | Documents per packing window |
+| `tokenizer_model_path` | Path to the SentencePiece model |
+| `split_by_shard` | Shard files across ranks instead of skipping records |
+
+**`train` section**
+
+| Key | Meaning |
+| --- | --- |
+| `train_batch_size` | Batch size **per process** |
+| `gradient_accumulation_steps` | Must match the value in the accelerate config |
+| `num_training_steps` | Total data steps; also the horizon of the cosine schedule |
+| `num_warmup_steps` | Linear warmup length |
+| `lr`, `weight_decay` | FusedAdam hyperparameters, `betas=(0.9, 0.95)` |
+| `ckpt` | Weights to initialize from; empty means random init |
+| `train_num_workers_4_dataloader`, `prefetch_factor` | Dataloader throughput knobs |
+| `train_and_eval` | Sample from `val_set_pretrain` during training |
+| `gradient_checkpointing_enable` | Trade compute for activation memory |
+| `use_lora` | Wrap the model with a LoRA adapter (`r=1`, `alpha=32`) |
+
+**Top level**
+
+| Key | Meaning |
+| --- | --- |
+| `log_interval`, `eval_interval`, `save_interval` | Cadence in global steps |
+| `work_dir` | Checkpoint root, also where resumption looks |
+| `project_name` | Weights & Biases project |
+
+Parameters with `bias`, `LayerNorm.weight` or `layernorm.weight` in their name are excluded from weight decay.
+
+### Model config (`configs/model_configs/*.json`)
+
+Any field of `Vocab32kGPT2MoeConfig` can be set here. Setting `n_routed_experts: null` turns every layer dense and
+reduces the model to plain GPT-2, which is a useful ablation baseline. See the class docstring for the full list,
+including `aux_loss_alpha`, `seq_aux`, `norm_topk_prob` and `scoring_func`.
+
+`vocab_size` and `pad_token_id` are overwritten at runtime from the tokenizer, so the JSON can never disagree with
+the SentencePiece model.
+
+## Distributed training
+
+`configs/accelerate_configs/` ships four bf16 DeepSpeed presets:
+
+| Config | ZeRO stage | Offload | Use when |
+| --- | --- | --- | --- |
+| `ds_stage1.yaml` | 1 | none | Fastest; model and optimizer fit comfortably |
+| `ds_stage2.yaml` | 2 | none | Default for every launch script |
+| `ds_stage3.yaml` | 3 | none | Parameter sharding needed |
+| `ds_stage3_offload.yaml` | 3 | CPU params + optimizer | Last resort when memory is tight |
+
+Two values must agree with your hardware and training config before launching:
+
+- `num_processes` must equal the number of devices in `CUDA_VISIBLE_DEVICES`. The shipped presets use 4, 6 or 8,
+  so adjust the file (or pass `--num_processes`) when your device list differs.
+- `gradient_accumulation_steps` in `ds_stage2.yaml` must match `train.gradient_accumulation_steps` in the training
+  config, since `Trainer` derives its logging and saving cadence from the accelerator value.
+
+## Checkpointing and resumption
+
+- Every `save_interval` global steps, `Trainer` calls `accelerator.save_state(work_dir/checkpoint_epoch{N})`,
+  which captures model, optimizer, scheduler and RNG state.
+- On startup, `Trainer.prepare` attempts `accelerator.load_state(work_dir)`. When it succeeds, the global step is
+  recovered from the scheduler and the dataloader is fast-forwarded with `skip_first_batches`, so no sample is
+  seen twice within the first epoch. When `work_dir` holds no usable checkpoint, training starts from scratch and
+  logs `No ckpt to resume in <work_dir>` together with the underlying reason.
+- To resume from a specific checkpoint rather than the latest state, point `train.ckpt` at that directory.
+
+## Logging
+
+Metrics go to Weights & Biases: loss, learning rate, loss scale, tokens/second/GPU, data step, global step and
+epoch. Runs are written to a local directory by default so training never blocks on network access:
+
+```bash
+# Stream to the W&B cloud instead of logging offline
+export WANDB_MODE=online
+export WANDB_API_KEY=<your-key>
+```
+
+`dpo.py` reports to TensorBoard by default; use `--report_to wandb` to switch.
+
+## Evaluation
+
+Generation smoke tests print completions for the fixed prompt suites in `dataset/validation.py`:
+
+```bash
+python scripts/eval/test_base_ckpt.py   # base model, val_set_pretrain
+python scripts/eval/test_sft_ckpt.py    # instruction-tuned model, val_set_sft
+```
+
+Both scripts load consolidated checkpoints by default. Use the `load_zero_checkpoint` helper in each script to
+rebuild fp32 weights straight from a sharded DeepSpeed ZeRO directory. Checkpoint paths are module-level
+constants at the top of each file.
+
+## Reproducibility
+
+- Dataset shuffling and file ordering are seeded (`seed=42`), and `dpo.py` calls `set_seed(--seed)`.
+- Archive the exact `configs/*.yaml` and model JSON used for a run; nothing else determines the recipe.
+- Record device count, GPU memory, CUDA version and the resolved dependency versions, since the effective global
+  batch size is `train_batch_size x num_processes x gradient_accumulation_steps`.
+
+## Notes and rough edges
+
+Known sharp edges worth reading before a long run:
+
+- The DPO prompt is rendered as `"### Instruction: " + question + "\n\n### System: \n"`, which differs from the
+  SFT template (`"### Instruction:\n..."`) by a space and a newline. Keep it in mind when comparing SFT and DPO
+  behaviour, or align the two templates.
+- `n_shared_experts` additionally requires `moe_intermediate_size` on the config, because the shared expert width
+  is `moe_intermediate_size * n_shared_experts`.
+- `load_tf_weights_in_vocab_32k_gpt2_moe` is inherited from the GPT-2 reference implementation. It only maps the
+  dense GPT-2 weight names, so it cannot restore routed experts and is not part of any supported path.
+- Resumption only reports "nothing to resume" for a missing or incomplete checkpoint. A corrupt checkpoint raises
+  instead of silently restarting from step 0, so an unexpected crash at startup points at `work_dir`.
+
+## Acknowledgements
+
+The training loop and streaming dataset are derived from [Open-Llama](https://github.com/s-JoL/Open-Llama). The
+modeling code follows the Hugging Face GPT-2 reference implementation, and the MoE gate and expert dispatch follow
+the DeepSeek-MoE design. Built on PyTorch, Transformers, Accelerate, DeepSpeed, Datasets, PEFT and TRL.

@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.model binary
+*.bin binary
+*.pt binary
+*.safetensors binary
+logs/*.out -text

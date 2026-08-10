@@ -1,20 +1,34 @@
+# Core training stack
 torch
+transformers
+accelerate==0.26.1
+deepspeed==0.13.1
+trl
+peft
+datasets
+sentencepiece
+pyyaml
+absl-py
+
+# Data loading and storage
+zstandard
+
+# Logging and diagnostics
+wandb
+torchinfo
+
+# Optional: kernels and extra runtimes
+triton
+xformers
+functorch
+
+# Optional: analysis, plotting and demo UIs
 torchvision
 torchaudio
-zstandard
-accelerate==0.26.1
-datasets
-wandb
-deepspeed==0.13.1
-absl-py
-torchinfo
 scikit-learn
 matplotlib
 seaborn
-sentencepiece
-triton
-functorch
-xformers
 gradio
-peft
-transformers
+
+# Optional: install separately, requires a matching CUDA toolchain
+# pip install flash-attn --no-build-isolation

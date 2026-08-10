@@ -1,16 +1,21 @@
-import torch
-import time
-import os
-import wandb
+"""Training loop with DeepSpeed/Accelerate, cosine schedule, W&B logging and checkpoint resumption."""
+
 import logging
-from torchinfo import summary
+import os
+import time
+
+import torch
+import wandb
 from deepspeed.ops.adam import FusedAdam
+from torchinfo import summary
 from transformers import get_cosine_schedule_with_warmup
 
 from dataset.validation import val_set_pretrain
 
-os.environ["WANDB_API_KEY"] = "d567cc8410bf55e544b5605cc13a300c607c77b1"
-os.environ["WANDB_MODE"] = "offline"
+# Log to a local W&B directory by default so that training never blocks on network access. Export
+# WANDB_MODE=online together with WANDB_API_KEY to stream metrics to the cloud instead.
+os.environ.setdefault("WANDB_MODE", "offline")
+
 
 class Trainer:
     def __init__(self, config, raw_model, train_loader, tokenizer, accelerator):
@@ -36,10 +41,6 @@ class Trainer:
             self.config["save_interval"] * accelerator.gradient_accumulation_steps
         )
         self.work_dir = self.config["work_dir"]
-        #self.ckpt_dir = self.config["ckpt_dir"]
-        #self.is_stage3 = self.config["train"]["is_stage3"]
-        #self.need_ckpt = self.config["train"]["need_ckpt"]
-        # self.get_model_info()
         if accelerator.is_main_process:
             wandb.init(project=self.config["project_name"])
 
@@ -99,19 +100,29 @@ class Trainer:
         )
         self.optim.zero_grad()
         self.global_step = 0
+        # Accelerate raises ValueError when work_dir holds no checkpoint and FileNotFoundError when the
+        # checkpoint is incomplete; both simply mean there is nothing to resume from. Any other failure
+        # (corrupt shards, shape mismatch, ...) must surface instead of being downgraded to a fresh run.
         try:
             self.accelerator.load_state(self.work_dir)
+        except (FileNotFoundError, ValueError) as error:
+            logging.warning(
+                "No ckpt to resume in {}, training from scratch ({}: {})".format(
+                    self.work_dir, type(error).__name__, error
+                )
+            )
+        else:
             self.global_step = self.scheduler.scheduler._step_count - 1
             self.global_step = self.global_step // self.accelerator.num_processes
-            logging.warning("Restored ckpt from {}".format(self.work_dir))
-        except:
-            logging.warning("No ckpt found in {}".format(self.work_dir))
+            logging.warning(
+                "Restored ckpt from {} at global step {}".format(self.work_dir, self.global_step)
+            )
         if self.global_step > 0:
             skip_steps = self.global_step * self.gradient_accumulation_steps
-            logging.warning("Skiped {} steps.".format(skip_steps))
-            self.train_loader_skiped = self.accelerator.skip_first_batches(self.train_loader, num_batches=skip_steps)
+            logging.warning("Skipped {} steps.".format(skip_steps))
+            self.train_loader_skipped = self.accelerator.skip_first_batches(self.train_loader, num_batches=skip_steps)
         else:
-            self.train_loader_skiped = self.train_loader
+            self.train_loader_skipped = self.train_loader
         self.accelerator.wait_for_everyone()
 
     def train_step(self, batch):
@@ -136,7 +147,7 @@ class Trainer:
             if self.data_step >= self.config["train"]["num_training_steps"]:
                 break
             if self.epoch == 0:
-                train_loader = self.train_loader_skiped
+                train_loader = self.train_loader_skipped
             else:
                 train_loader = self.train_loader
 

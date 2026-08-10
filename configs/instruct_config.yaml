@@ -1,8 +1,10 @@
+# Stage 2 - Supervised fine-tuning on instruction data.
+# Launch: bash scripts/launch/sft.sh
 data:
-  mode: "instruct"
-  data: 
+  mode: "instruct"                 # pretrain | instruct
+  data:                            # name -> glob pattern of JSONL shards
     mixed: "data/sft_merge.jsonl"
-  pad_to_max: True
+  pad_to_max: True                 # SFT masks the prompt, so every sample is padded to seq_length
   sequence_sample_mode: "truncation"
   concat_multiple_sequence: False
   num_sequences: 50
@@ -10,21 +12,21 @@ data:
   tokenizer_model_path: "configs/tokenizer_models/vocab_32k_gpt2_moe.model"
   split_by_shard: False
 train:
-  train_batch_size: 8
-  # 1B token for 1 epoch, 5epoch
+  train_batch_size: 8              # per-process batch size
+  # ~1B tokens per epoch, 5 epochs
   num_training_steps: 1000000
   num_warmup_steps: 500
   initializer_range: 1.0e-2
   lr: 2.0e-4
   weight_decay: 1.0e-1
-  ckpt: "ckpt/vocab_32k_gpt2_moe/"
+  ckpt: "ckpt/vocab_32k_gpt2_moe/"  # pretrained base model
   train_num_workers_4_dataloader: 16
   gradient_accumulation_steps: 5
   prefetch_factor: 100
   train_and_eval: False
   gradient_checkpointing_enable: False
   use_lora: False
-# global step
+# Intervals below are expressed in global steps.
 log_interval: 10
 eval_interval: 500
 save_interval: 5000

@@ -13,12 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch vocab_32k_GPT2_MOE model."""
+"""PyTorch Vocab32kGPT2Moe model."""
 
 import math
 import os
 import warnings
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -26,7 +25,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.cuda.amp import autocast
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+from torch.nn import CrossEntropyLoss
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
@@ -36,7 +35,6 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_conv1d_layer
 from transformers.utils import (
-    ModelOutput,
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -45,7 +43,7 @@ from transformers.utils import (
     logging,
 )
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
-from models.configuration_vocab_32k_gpt2_moe import vocab_32k_gpt2moeConfig
+from models.configuration_vocab_32k_gpt2_moe import Vocab32kGPT2MoeConfig
 
 
 if is_flash_attn_2_available():
@@ -56,7 +54,7 @@ if is_flash_attn_2_available():
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "vocab_32k_gpt2_moe"
-_CONFIG_FOR_DOC = "vocab_32k_GPT2MOEConfig"
+_CONFIG_FOR_DOC = "Vocab32kGPT2MoeConfig"
 
 
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
@@ -72,8 +70,12 @@ def _get_unpad_data(attention_mask):
     )
 
 
-def load_tf_weights_in_vocab_32k_gpt2moe(model, config, vocab_32k_gpt2moe_checkpoint_path):
-    """Load tf checkpoints in a pytorch model"""
+def load_tf_weights_in_vocab_32k_gpt2_moe(model, config, vocab_32k_gpt2moe_checkpoint_path):
+    """Load tf checkpoints in a pytorch model.
+
+    Inherited from the GPT-2 reference implementation. It only maps the dense GPT-2 weight names, so it cannot
+    restore the routed experts of an MoE checkpoint.
+    """
     try:
         import re
 
@@ -84,7 +86,7 @@ def load_tf_weights_in_vocab_32k_gpt2moe(model, config, vocab_32k_gpt2moe_checkp
             "https://www.tensorflow.org/install/ for installation instructions."
         )
         raise
-    tf_path = os.path.abspath(gpt2_checkpoint_path)
+    tf_path = os.path.abspath(vocab_32k_gpt2moe_checkpoint_path)
     logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
     # Load weights from TF model
     init_vars = tf.train.list_variables(tf_path)
@@ -128,7 +130,7 @@ def load_tf_weights_in_vocab_32k_gpt2moe(model, config, vocab_32k_gpt2moe_checkp
     return model
 
 
-class vocab_32k_GPT2MOEAttention(nn.Module):
+class Vocab32kGPT2MoeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
         self.config = config
@@ -311,7 +313,7 @@ class vocab_32k_GPT2MOEAttention(nn.Module):
             if not hasattr(self, "q_attn"):
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
-                    "Please make sure to instantiate class with `vocab_32k_GPT2MOEAttention(..., is_cross_attention=True)`."
+                    "Please make sure to instantiate class with `Vocab32kGPT2MoeAttention(..., is_cross_attention=True)`."
                 )
 
             query = self.q_attn(hidden_states)
@@ -350,11 +352,11 @@ class vocab_32k_GPT2MOEAttention(nn.Module):
         return outputs  # a, present, (attentions)
 
 
-class vocab_32k_GPT2MOEFlashAttention2(vocab_32k_GPT2MOEAttention):
+class Vocab32kGPT2MoeFlashAttention2(Vocab32kGPT2MoeAttention):
     """
-    vocab_32k_GPT2MOE flash attention module. This module inherits from `vocab_32k_GPT2MOEAttention` as the weights of the module stays
-    untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
-    flash attention and deal with padding tokens in case the input contains any of them.
+    Vocab32kGPT2Moe flash attention module. This module inherits from `Vocab32kGPT2MoeAttention` as the weights of the
+    module stays untouched. The only required change would be on the forward pass where it needs to correctly call the
+    public API of flash attention and deal with padding tokens in case the input contains any of them.
     """
 
     def __init__(self, *args, **kwargs):
@@ -553,7 +555,7 @@ class vocab_32k_GPT2MOEFlashAttention2(vocab_32k_GPT2MOEAttention):
             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
         )
 
-class vocab_32k_GPT2MLP(nn.Module):
+class Vocab32kGPT2MLP(nn.Module):
     def __init__(self, intermediate_size, config):
         super().__init__()
         embed_dim = config.hidden_size
@@ -571,6 +573,12 @@ class vocab_32k_GPT2MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
+    """Top-k router.
+
+    Returns the selected expert indices, their (optionally renormalized) weights, and a load-balancing auxiliary
+    loss. `config.seq_aux` selects whether the load is balanced per sequence or across the whole flattened batch.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -588,8 +596,7 @@ class MoEGate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        import torch.nn.init  as init
-        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
     
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape        
@@ -650,19 +657,25 @@ class AddAuxiliaryLoss(torch.autograd.Function):
         return grad_output, grad_loss
     
 
-class vocab_32k_GPT2MOE(nn.Module):
-    """
-    A mixed expert module containing shared experts.
+class Vocab32kGPT2SparseMoeBlock(nn.Module):
+    """Sparse feed-forward block: `num_experts_per_tok` of `n_routed_experts` experts run per token.
+
+    Training and inference take different paths on purpose. Training repeats each token once per selected expert so
+    that the whole batch can be dispatched with a boolean mask, which keeps the graph simple for autograd. Inference
+    instead sorts tokens by expert id and runs every expert exactly once over its contiguous slice.
+
+    When `config.n_shared_experts` is set, an always-active expert is evaluated on the unrouted input and added to
+    the routed output.
     """
     def __init__(self, intermediate_size, config):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.experts = nn.ModuleList([vocab_32k_GPT2MLP(intermediate_size, config) for i in range(config.n_routed_experts)])
+        self.experts = nn.ModuleList([Vocab32kGPT2MLP(intermediate_size, config) for i in range(config.n_routed_experts)])
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = vocab_32k_GPT2MLP(config=config, intermediate_size=intermediate_size)
+            self.shared_experts = Vocab32kGPT2MLP(config=config, intermediate_size=intermediate_size)
     
     def forward(self, hidden_states):
         identity = hidden_states
@@ -702,16 +715,18 @@ class vocab_32k_GPT2MOE(nn.Module):
             expert_cache.scatter_reduce_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out, reduce='sum')
         return expert_cache
 
-GPT2_ATTENTION_CLASSES = {
-    "eager": vocab_32k_GPT2MOEAttention,
-    "flash_attention_2": vocab_32k_GPT2MOEFlashAttention2,
+VOCAB_32K_GPT2_MOE_ATTENTION_CLASSES = {
+    "eager": Vocab32kGPT2MoeAttention,
+    "flash_attention_2": Vocab32kGPT2MoeFlashAttention2,
 }
-class vocab_32k_gpt2_MOEDecoderLayer(nn.Module):
-    def __init__(self, config:vocab_32k_gpt2moeConfig, layer_idx=int):
+
+
+class Vocab32kGPT2MoeDecoderLayer(nn.Module):
+    def __init__(self, config: Vocab32kGPT2MoeConfig, layer_idx=int):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
-        attention_class = GPT2_ATTENTION_CLASSES[config._attn_implementation]
+        attention_class = VOCAB_32K_GPT2_MOE_ATTENTION_CLASSES[config._attn_implementation]
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = attention_class(config=config, layer_idx=layer_idx)
@@ -721,9 +736,9 @@ class vocab_32k_gpt2_MOEDecoderLayer(nn.Module):
             self.crossattention = attention_class(config=config, is_cross_attention=True, layer_idx=layer_idx)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = vocab_32k_GPT2MOE(inner_dim, config) if (config.n_routed_experts is not None and  \
+        self.mlp = Vocab32kGPT2SparseMoeBlock(inner_dim, config) if (config.n_routed_experts is not None and  \
                                            layer_idx >= config.first_k_dense_replace and layer_idx % config.moe_layer_freq == 0) \
-                                        else vocab_32k_GPT2MLP(inner_dim, config)
+                                        else Vocab32kGPT2MLP(inner_dim, config)
 
     def forward(
         self,
@@ -787,18 +802,18 @@ class vocab_32k_gpt2_MOEDecoderLayer(nn.Module):
         return outputs  # hidden_states, present, (attentions, cross_attentions)
 
 
-class vocab_32k_GPT2MOEPreTrainedModel(PreTrainedModel):
+class Vocab32kGPT2MoePreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
 
-    config_class = vocab_32k_gpt2moeConfig
-    load_tf_weights = load_tf_weights_in_vocab_32k_gpt2moe
+    config_class = Vocab32kGPT2MoeConfig
+    load_tf_weights = load_tf_weights_in_vocab_32k_gpt2_moe
     base_model_prefix = "transformer"
     is_parallelizable = True
     supports_gradient_checkpointing = True
-    _no_split_modules = ["GPT2Block"]
+    _no_split_modules = ["Vocab32kGPT2MoeDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
 
@@ -833,49 +848,7 @@ class vocab_32k_GPT2MOEPreTrainedModel(PreTrainedModel):
                 p.data.normal_(mean=0.0, std=(self.config.initializer_range / math.sqrt(2 * self.config.n_layer)))
 
 
-@dataclass
-class GPT2DoubleHeadsModelOutput(ModelOutput):
-    """
-    Base class for outputs of models predicting if two sentences are consecutive or not.
-
-    Args:
-        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            Language modeling loss.
-        mc_loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `mc_labels` is provided):
-            Multiple choice classification loss.
-        logits (`torch.FloatTensor` of shape `(batch_size, num_choices, sequence_length, config.vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        mc_logits (`torch.FloatTensor` of shape `(batch_size, num_choices)`):
-            Prediction scores of the multiple choice classification head (scores for each choice before SoftMax).
-        past_key_values (`Tuple[Tuple[torch.Tensor]]`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-            Tuple of length `config.n_layers`, containing tuples of tensors of shape `(batch_size, num_heads,
-            sequence_length, embed_size_per_head)`).
-
-            Contains pre-computed hidden-states (key and values in the attention blocks) that can be used (see
-            `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings + one for the output of each layer) of
-            shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-
-            GPT2Attentions weights after the attention softmax, used to compute the weighted average in the
-            self-attention heads.
-    """
-
-    loss: Optional[torch.FloatTensor] = None
-    mc_loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
-    mc_logits: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-
-
-GPT2_START_DOCSTRING = r"""
+VOCAB_32K_GPT2_MOE_START_DOCSTRING = r"""
 
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
@@ -886,12 +859,12 @@ GPT2_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`GPT2Config`]): Model configuration class with all the parameters of the model.
+        config ([`Vocab32kGPT2MoeConfig`]): Model configuration class with all the parameters of the model.
             Initializing with a config file does not load the weights associated with the model, only the
             configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
 
-GPT2_INPUTS_DOCSTRING = r"""
+VOCAB_32K_GPT2_MOE_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
@@ -968,24 +941,19 @@ PARALLELIZE_DOCSTRING = r"""
         device_map (`Dict[int, list]`, optional, defaults to None):
             A dictionary that maps attention modules to devices. Note that the embedding module and LMHead are always
             automatically mapped to the first device (for esoteric reasons). That means that the first device should
-            have fewer attention modules mapped to it than other devices. For reference, the gpt2 models have the
-            following number of attention modules:
-
-                - openai-community/gpt2: 12
-                - openai-community/gpt2-medium: 24
-                - openai-community/gpt2-large: 36
-                - openai-community/gpt2-xl: 48
+            have fewer attention modules mapped to it than other devices. The default configuration has
+            `n_layer = 12` attention modules.
 
     Example:
 
     ```python
-    # Here is an example of a device map on a machine with 4 GPUs using gpt2-xl, which has a total of 48 attention modules:
-    model = GPT2LMHeadModel.from_pretrained("openai-community/gpt2-xl")
+    # Splitting the default 12-layer model across 4 GPUs:
+    model = Vocab32kGPT2MoeForCausalLM.from_pretrained("ckpt/vocab_32k_gpt2_moe")
     device_map = {
-        0: [0, 1, 2, 3, 4, 5, 6, 7, 8],
-        1: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
-        2: [22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34],
-        3: [35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47],
+        0: [0, 1],
+        1: [2, 3, 4, 5],
+        2: [6, 7, 8],
+        3: [9, 10, 11],
     }
     model.parallelize(device_map)
     ```
@@ -996,14 +964,9 @@ DEPARALLELIZE_DOCSTRING = r"""
     Example:
 
     ```python
-    # On a 4 GPU machine with openai-community/gpt2-large:
-    model = GPT2LMHeadModel.from_pretrained("openai-community/gpt2-large")
-    device_map = {
-        0: [0, 1, 2, 3, 4, 5, 6, 7],
-        1: [8, 9, 10, 11, 12, 13, 14, 15],
-        2: [16, 17, 18, 19, 20, 21, 22, 23],
-        3: [24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35],
-    }
+    # On a 4 GPU machine:
+    model = Vocab32kGPT2MoeForCausalLM.from_pretrained("ckpt/vocab_32k_gpt2_moe")
+    device_map = {0: [0, 1, 2], 1: [3, 4, 5], 2: [6, 7, 8], 3: [9, 10, 11]}
     model.parallelize(device_map)  # Splits the model across several devices
     model.deparallelize()  # Put the model back on cpu and cleans memory by calling torch.cuda.empty_cache()
     ```
@@ -1011,11 +974,11 @@ DEPARALLELIZE_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare GPT2 Model transformer outputting raw hidden-states without any specific head on top.",
-    GPT2_START_DOCSTRING,
+    "The bare Vocab32kGPT2Moe transformer outputting raw hidden-states without any specific head on top.",
+    VOCAB_32K_GPT2_MOE_START_DOCSTRING,
 )
-class vocab_32k_GPT2MOEModel(vocab_32k_GPT2MOEPreTrainedModel):
-    def __init__(self, config:vocab_32k_gpt2moeConfig):
+class Vocab32kGPT2MoeModel(Vocab32kGPT2MoePreTrainedModel):
+    def __init__(self, config:Vocab32kGPT2MoeConfig):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
@@ -1024,7 +987,7 @@ class vocab_32k_GPT2MOEModel(vocab_32k_GPT2MOEPreTrainedModel):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([vocab_32k_gpt2_MOEDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([Vocab32kGPT2MoeDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Model parallel
@@ -1040,7 +1003,8 @@ class vocab_32k_GPT2MOEModel(vocab_32k_GPT2MOEPreTrainedModel):
     def parallelize(self, device_map=None):
         # Check validity of device_map
         warnings.warn(
-            "`GPT2Model.parallelize` is deprecated and will be removed in v5 of Transformers, you should load your"
+            "`Vocab32kGPT2MoeModel.parallelize` is deprecated and will be removed in v5 of Transformers, you should"
+            " load your"
             " model with `device_map='balanced'` in the call to `from_pretrained`. You can also provide your own"
             " `device_map` but it needs to be a dictionary module_name to device, so for instance {'h.0': 0, 'h.1': 1,"
             " ...}",
@@ -1093,7 +1057,7 @@ class vocab_32k_GPT2MOEModel(vocab_32k_GPT2MOEPreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.h[layer].attn.prune_heads(heads)
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(VOCAB_32K_GPT2_MOE_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=BaseModelOutputWithPastAndCrossAttentions,
@@ -1291,17 +1255,17 @@ class vocab_32k_GPT2MOEModel(vocab_32k_GPT2MOEPreTrainedModel):
 
 @add_start_docstrings(
     """
-    The GPT2 Model transformer with a language modeling head on top (linear layer with weights tied to the input
+    The Vocab32kGPT2Moe transformer with a language modeling head on top (linear layer with weights tied to the input
     embeddings).
     """,
-    GPT2_START_DOCSTRING,
+    VOCAB_32K_GPT2_MOE_START_DOCSTRING,
 )
-class vocab_32k_GPT2MOELMHeadModel(vocab_32k_GPT2MOEPreTrainedModel):
+class Vocab32kGPT2MoeForCausalLM(Vocab32kGPT2MoePreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.transformer = vocab_32k_GPT2MOEModel(config)
+        self.transformer = Vocab32kGPT2MoeModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Model parallel
@@ -1314,7 +1278,8 @@ class vocab_32k_GPT2MOELMHeadModel(vocab_32k_GPT2MOEPreTrainedModel):
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
         warnings.warn(
-            "`GPT2LMHeadModel.parallelize` is deprecated and will be removed in v5 of Transformers, you should load"
+            "`Vocab32kGPT2MoeForCausalLM.parallelize` is deprecated and will be removed in v5 of Transformers, you"
+            " should load"
             " your model with `device_map='balanced'` in the call to `from_pretrained`. You can also provide your own"
             " `device_map` but it needs to be a dictionary module_name to device, so for instance {'transformer.h.0':"
             " 0, 'transformer.h.1': 1, ...}",
@@ -1395,7 +1360,7 @@ class vocab_32k_GPT2MOELMHeadModel(vocab_32k_GPT2MOEPreTrainedModel):
 
         return model_inputs
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(VOCAB_32K_GPT2_MOE_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=CausalLMOutputWithCrossAttentions,
@@ -1473,3 +1438,15 @@ class vocab_32k_GPT2MOELMHeadModel(vocab_32k_GPT2MOEPreTrainedModel):
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
         )
+
+
+# Deprecated aliases kept so that checkpoints and launch scripts written against the
+# original snake_case class names keep working. Prefer the CamelCase names above.
+vocab_32k_GPT2MOEAttention = Vocab32kGPT2MoeAttention
+vocab_32k_GPT2MOEFlashAttention2 = Vocab32kGPT2MoeFlashAttention2
+vocab_32k_GPT2MLP = Vocab32kGPT2MLP
+vocab_32k_GPT2MOE = Vocab32kGPT2SparseMoeBlock
+vocab_32k_gpt2_MOEDecoderLayer = Vocab32kGPT2MoeDecoderLayer
+vocab_32k_GPT2MOEPreTrainedModel = Vocab32kGPT2MoePreTrainedModel
+vocab_32k_GPT2MOEModel = Vocab32kGPT2MoeModel
+vocab_32k_GPT2MOELMHeadModel = Vocab32kGPT2MoeForCausalLM
